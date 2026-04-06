@@ -446,7 +446,10 @@ jobs:
           if [ -n "$VERMAGIC_FILE" ] && [ -f "$VERMAGIC_FILE" ]; then
             VERMAGIC_HASH=$(cat "$VERMAGIC_FILE")
             # .vermagic 仅含 hash, 需要结合内核版本
-            LINUX_VER=$(ls -d build_dir/target-*/linux-*/ 2>/dev/null | head -1 | grep -oP 'linux-\K[^/]+')
+            LINUX_VER=""
+            for d in build_dir/target-*/linux-*/; do
+              [ -d "$d" ] && LINUX_VER=$(basename "$d" | sed 's/^linux-//') && break
+            done
             KVER=$(cat include/kernel-version.mk 2>/dev/null | grep '^LINUX_VERSION-' | head -1 | cut -d= -f2)
             if [ -n "$KVER" ] && [ -n "$VERMAGIC_HASH" ]; then
               VERMAGIC="${KVER}-1-${VERMAGIC_HASH}"
@@ -458,7 +461,7 @@ jobs:
         # 提取完整内核版本号
         # 方法A: 从 vermagic 提取 (如 6.6.127~hash-r1 → 6.6.127)
         if [ -n "$VERMAGIC" ]; then
-          KERNEL_VER=$(echo "$VERMAGIC" | grep -oP '^\d+\.\d+\.\d+')
+          KERNEL_VER=$(echo "$VERMAGIC" | sed -n 's/^\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')
         fi
         # 方法B: 从 include/kernel-version.mk 读取
         if [ -z "$KERNEL_VER" ] && [ -f "include/kernel-version.mk" ]; then
@@ -537,7 +540,7 @@ jobs:
         FAILED=0
         if [ -d "logs" ]; then
           # 搜索编译日志中的 ERROR 和 failed 关键字
-          FAILED=$(find logs/ -name "*.txt" 2>/dev/null | xargs grep -l -i "error\|failed to build" 2>/dev/null | wc -l)
+          FAILED=$(find logs/ -name "*.txt" 2>/dev/null | xargs -r grep -l -i "error\|failed to build" 2>/dev/null | wc -l)
         fi
 
         # 同时从编译日志中提取失败信息
