@@ -1,0 +1,717 @@
+# ============================================================
+# OpenWrt 云源自动构建工作流
+# 功能: 全量编译 OpenWrt 所有软件包并部署为 opkg 在线软件源
+# 平台: MediaTek Filogic (MT7981/MT7986/MT7988)
+#
+# 100% 兼容模式:
+#   设置 CONFIG_REPO 和 GH_TOKEN secrets 后，工作流会克隆固件编译使用的
+#   私有配置仓库，应用相同的 diy 脚本和基础配置，确保内核模块 vermagic
+#   完全一致，实现 kmod 包 100% 兼容。
+# ============================================================
+
+name: 构建 OpenWrt 云源
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt 版本标签 (例: v24.10.6)'
+        required: true
+        default: 'v24.10.6'
+        type: string
+      config_repo:
+        description: '私有配置仓库 (例: mzwrt/config, 留空则使用默认配置)'
+        required: false
+        default: ''
+        type: string
+      config_ref:
+        description: '配置仓库分支 (默认 main)'
+        required: false
+        default: 'main'
+        type: string
+
+  # 允许固件编译仓库通过 repository_dispatch 触发同步构建
+  repository_dispatch:
+    types: [trigger-build]
+
+  schedule:
+    # 每周六北京时间上午10点 (UTC 02:00) 自动构建
+    - cron: '0 2 * * 6'
+
+  push:
+    branches: [main]
+    paths:
+      - 'config/**'
+      - 'scripts/**'
+      - '.github/workflows/build-repo.yml'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: build-packages
+  cancel-in-progress: true
+
+env:
+  OPENWRT_VERSION: ${{ inputs.openwrt_version || 'v24.10.6' }}
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  TARGET: mediatek
+  SUBTARGET: filogic
+  ARCH: aarch64_cortex-a53
+  TZ: Asia/Shanghai
+  # 私有配置仓库 (优先使用 inputs, 其次 secrets, 最后留空)
+  CONFIG_REPO: ${{ inputs.config_repo || secrets.CONFIG_REPO || '' }}
+  CONFIG_REF: ${{ inputs.config_ref || 'main' }}
+
+jobs:
+  # ==================== 编译任务 ====================
+  build:
+    name: 编译全部软件包
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+    # ----- 1. 检出仓库 -----
+    - name: 检出仓库
+      uses: actions/checkout@v4
+
+    # ----- 2. 释放磁盘空间 -----
+    - name: 释放磁盘空间
+      run: |
+        echo "===== 清理前磁盘使用情况 ====="
+        df -hT
+
+        # 删除不需要的大型软件包和工具
+        sudo rm -rf /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/share/boost \
+          /usr/share/swift \
+          /usr/local/share/chromium \
+          /usr/local/share/powershell
+
+        # 删除 Docker 镜像
+        sudo docker rmi $(docker image ls -aq) 2>/dev/null || true
+
+        # 卸载不需要的系统软件
+        sudo apt-get purge -yqq \
+          azure-cli* google-cloud-cli microsoft-edge-stable \
+          google-chrome-stable firefox dotnet* aspnetcore* \
+          powershell* openjdk* adoptopenjdk* \
+          php* mysql* mongodb* moby* snap* 2>/dev/null || true
+
+        sudo apt-get autoremove -yqq
+        sudo apt-get autoclean
+        sudo rm -rf /var/lib/apt/lists/* /tmp/*
+
+        echo "===== 清理后磁盘使用情况 ====="
+        df -hT
+
+    # ----- 3. 初始化编译环境 (与固件编译完全一致的依赖列表) -----
+    - name: 初始化编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get update
+        sudo -E apt-get -yqq upgrade
+        sudo -E apt-get -yqq full-upgrade
+
+        # 安装编译依赖 (合并固件编译仓库和云源编译所需的全部包)
+        sudo -E apt-get install -yqq \
+          ack antlr3 asciidoc autoconf automake autopoint \
+          babeltrace binutils binutils-gold bison build-essential bzip2 \
+          ccache clang cmake cpio cpanminus curl \
+          device-tree-compiler dos2unix \
+          ecj fastjar flex \
+          gawk gcc-multilib g++-multilib gettext git gnutls-dev golang gperf \
+          haveged help2man \
+          intltool \
+          jq \
+          lib32gcc-s1 libc6-dev-i386 libcrypto++-dev libelf-dev \
+          libev-dev libfdt-dev libfile-spec-perl libfuse-dev \
+          libglib2.0-dev libgmp3-dev libltdl-dev liblua5.1-0 \
+          liblzma-dev libmpc-dev libmpfr-dev \
+          libncurses5-dev libncursesw5-dev libnuma-dev \
+          libpam0g-dev libpcre3 libpcre3-dev libperl-dev \
+          libpython3-dev libreadline-dev libsnmp-dev libssl-dev \
+          libtext-template-perl libtirpc-dev libtool libtool-bin \
+          libtorrent-rasterbar-dev libunwind-dev libz-dev libzstd-dev \
+          lrzsz \
+          m4 mkisofs msmtp \
+          nano ninja-build \
+          p7zip p7zip-full patch perl perl-modules pkgconf \
+          python3 python3-netifaces python3-pip python3-ply \
+          python3-pyelftools python3-setuptools python3-socks python3-unidecode \
+          qemu-utils \
+          re2c rsync rustc cargo \
+          scons squashfs-tools subversion swig \
+          texinfo \
+          uglifyjs unzip upx-ucl \
+          wget \
+          xmlto xxd \
+          zlib1g-dev zstd
+
+        sudo -E apt-get -yqq autoremove --purge
+        sudo -E apt-get clean
+        sudo -E systemctl daemon-reload
+        sudo -E timedatectl set-timezone "$TZ"
+
+    # ----- 4. 恢复缓存 -----
+    - name: 恢复 ccache 缓存
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ env.TARGET }}-${{ env.SUBTARGET }}-${{ env.OPENWRT_VERSION }}
+        restore-keys: |
+          ccache-${{ env.TARGET }}-${{ env.SUBTARGET }}-
+
+    - name: 恢复 DL 缓存
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: dl-${{ env.TARGET }}-${{ env.OPENWRT_VERSION }}
+        restore-keys: |
+          dl-${{ env.TARGET }}-
+
+    - name: 配置 ccache
+      run: |
+        ccache -M 5G
+        ccache -o compression=true
+        ccache -z
+
+    # ----- 5. 克隆 OpenWrt 源码 -----
+    - name: 克隆 OpenWrt 源码
+      run: |
+        git clone -b ${{ env.OPENWRT_VERSION }} --single-branch --depth=1 \
+          ${{ env.OPENWRT_REPO }} openwrt
+        echo "OpenWrt 源码版本: $(cd openwrt && git log --oneline -1)"
+
+    # ----- 6. [100% 兼容] 克隆私有配置仓库 -----
+    - name: 克隆私有配置仓库
+      if: env.CONFIG_REPO != ''
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.CONFIG_REPO }}
+        token: ${{ secrets.GH_TOKEN }}
+        ref: ${{ env.CONFIG_REF }}
+        path: private-config
+
+    - name: 检测私有配置结构
+      if: env.CONFIG_REPO != ''
+      id: private_config
+      run: |
+        echo "===== 私有配置仓库内容 ====="
+        ls -la private-config/ 2>/dev/null || true
+
+        # 查找配置目录 (支持 mzwrt-openwrt/ 或根目录)
+        CONFIG_DIR=""
+        if [ -d "private-config/mzwrt-openwrt" ]; then
+          CONFIG_DIR="private-config/mzwrt-openwrt"
+        else
+          CONFIG_DIR="private-config"
+        fi
+        echo "config_dir=$CONFIG_DIR" >> $GITHUB_OUTPUT
+
+        # 检测可用文件
+        [ -f "$CONFIG_DIR/diy1.sh" ] && echo "has_diy1=true" >> $GITHUB_OUTPUT || echo "has_diy1=false" >> $GITHUB_OUTPUT
+        [ -f "$CONFIG_DIR/diy2.sh" ] && echo "has_diy2=true" >> $GITHUB_OUTPUT || echo "has_diy2=false" >> $GITHUB_OUTPUT
+
+        # 查找设备配置文件 (.config 或 *.config)
+        DEVICE_CONFIG=""
+        for cfg in "$CONFIG_DIR/rax3000m.config" "$CONFIG_DIR/.config" "$CONFIG_DIR"/*.config; do
+          if [ -f "$cfg" ]; then
+            DEVICE_CONFIG="$cfg"
+            break
+          fi
+        done
+        echo "device_config=$DEVICE_CONFIG" >> $GITHUB_OUTPUT
+
+        echo "配置目录: $CONFIG_DIR"
+        echo "diy1.sh: $([ -f "$CONFIG_DIR/diy1.sh" ] && echo '找到' || echo '未找到')"
+        echo "diy2.sh: $([ -f "$CONFIG_DIR/diy2.sh" ] && echo '找到' || echo '未找到')"
+        echo "设备配置: ${DEVICE_CONFIG:-未找到}"
+
+    # ----- 7. 应用 diy1.sh (feeds 更新前) -----
+    # 优先使用私有配置的 diy1.sh, 其次使用本仓库的
+    - name: 应用 diy1.sh (私有配置)
+      if: env.CONFIG_REPO != '' && steps.private_config.outputs.has_diy1 == 'true'
+      run: |
+        cd openwrt
+        cp -f "$GITHUB_WORKSPACE/${{ steps.private_config.outputs.config_dir }}/diy1.sh" ./diy1.sh
+        chmod +x ./diy1.sh
+        echo "===== 执行私有配置 diy1.sh ====="
+        bash ./diy1.sh
+
+    - name: 应用 diy1.sh (本仓库)
+      if: env.CONFIG_REPO == '' && hashFiles('scripts/diy1.sh') != ''
+      run: |
+        cd openwrt
+        chmod +x $GITHUB_WORKSPACE/scripts/diy1.sh
+        bash $GITHUB_WORKSPACE/scripts/diy1.sh
+
+    # ----- 8. 添加第三方软件源 -----
+    - name: 添加第三方软件源
+      run: |
+        cd openwrt
+        chmod +x $GITHUB_WORKSPACE/scripts/add-feeds.sh
+        bash $GITHUB_WORKSPACE/scripts/add-feeds.sh
+
+    # ----- 9. 更新并安装软件源 -----
+    - name: 更新软件源
+      run: |
+        cd openwrt
+        # 逐个更新, 容忍单个源失败
+        for feed in $(awk '/^src-git/{print $2}' feeds.conf.default); do
+          echo "更新 feed: $feed"
+          ./scripts/feeds update "$feed" 2>&1 || echo "⚠️ feed $feed 更新失败, 继续..."
+        done
+        echo ""
+        echo "===== 已更新的软件源 ====="
+        ls -la feeds/
+
+    - name: 安装软件源
+      run: |
+        cd openwrt
+        ./scripts/feeds install -a -f 2>&1 | tee /tmp/feeds_install.log
+
+    # ----- 10. 应用 diy2.sh (feeds 安装后) -----
+    - name: 应用 diy2.sh (私有配置)
+      if: env.CONFIG_REPO != '' && steps.private_config.outputs.has_diy2 == 'true'
+      run: |
+        cd openwrt
+        cp -f "$GITHUB_WORKSPACE/${{ steps.private_config.outputs.config_dir }}/diy2.sh" ./diy2.sh
+        chmod +x ./diy2.sh
+        echo "===== 执行私有配置 diy2.sh ====="
+        bash ./diy2.sh
+
+    - name: 应用 diy2.sh (本仓库)
+      if: env.CONFIG_REPO == '' && hashFiles('scripts/diy2.sh') != ''
+      run: |
+        cd openwrt
+        chmod +x $GITHUB_WORKSPACE/scripts/diy2.sh
+        bash $GITHUB_WORKSPACE/scripts/diy2.sh
+
+    # ----- 11. 加载编译配置 -----
+    - name: 加载编译配置
+      run: |
+        cd openwrt
+
+        # 如果有私有设备配置, 先以它为基础
+        DEVICE_CONFIG="${{ steps.private_config.outputs.device_config }}"
+        if [ -n "$DEVICE_CONFIG" ] && [ -f "$GITHUB_WORKSPACE/$DEVICE_CONFIG" ]; then
+          echo "===== 使用私有设备配置作为基础 ====="
+          cp "$GITHUB_WORKSPACE/$DEVICE_CONFIG" .config
+          echo "" >> .config
+          echo "# ===== 云源扩展配置 (追加到固件基础配置之上) =====" >> .config
+          cat $GITHUB_WORKSPACE/config/seed.config >> .config
+        else
+          echo "===== 使用默认云源配置 ====="
+          cp $GITHUB_WORKSPACE/config/seed.config .config
+        fi
+
+        make defconfig
+
+        echo "========== 编译配置摘要 =========="
+        echo "目标平台: $(grep '^CONFIG_TARGET_BOARD=' .config | cut -d= -f2 | tr -d '"')"
+        echo "子目标: $(grep '^CONFIG_TARGET_SUBTARGET=' .config | cut -d= -f2 | tr -d '"')"
+        echo "ALL_KMODS: $(grep 'CONFIG_ALL_KMODS' .config || echo '未设置')"
+        echo "ALL_NONSHARED: $(grep 'CONFIG_ALL_NONSHARED' .config || echo '未设置')"
+        TOTAL_Y=$(grep -c "=y" .config || true)
+        TOTAL_M=$(grep -c "=m" .config || true)
+        echo "编译选项: $TOTAL_Y (=y) + $TOTAL_M (=m)"
+        echo "私有配置: $([ -n "$DEVICE_CONFIG" ] && echo '已加载 (100%兼容模式)' || echo '未使用 (独立模式)')"
+        echo "=================================="
+
+    # ----- 12. 下载编译依赖 -----
+    - name: 下载编译所需源码包
+      run: |
+        cd openwrt
+        make download -j16 2>&1 | tee /tmp/download.log
+        # 清除损坏的下载 (小于1KB的文件)
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        # 重试失败的下载
+        make download -j4 2>&1 | tee -a /tmp/download.log || true
+        echo "下载目录大小: $(du -sh dl | cut -f1)"
+
+    # ----- 13. 编译全部软件包 -----
+    - name: 编译工具链和内核
+      run: |
+        cd openwrt
+        echo "============================================"
+        echo " 编译工具链和内核 - $(date '+%Y-%m-%d %H:%M:%S')"
+        echo " CPU: $(nproc) 核心"
+        echo " 内存: $(free -h | awk '/^Mem:/{print $2}')"
+        echo " 磁盘剩余: $(df -h . | awk 'NR==2{print $4}')"
+        echo "============================================"
+
+        # 先编译工具链和内核 (这部分必须成功)
+        make tools/install -j$(nproc) 2>&1 | tee /tmp/build_tools.log || \
+          make tools/install -j1 V=s 2>&1 | tee -a /tmp/build_tools.log
+        make toolchain/install -j$(nproc) 2>&1 | tee /tmp/build_toolchain.log || \
+          make toolchain/install -j1 V=s 2>&1 | tee -a /tmp/build_toolchain.log
+        make target/compile -j$(nproc) 2>&1 | tee /tmp/build_kernel.log || \
+          make target/compile -j1 V=s 2>&1 | tee -a /tmp/build_kernel.log
+
+        echo "工具链和内核编译完成 - $(date '+%Y-%m-%d %H:%M:%S')"
+
+    - name: 编译全部软件包
+      run: |
+        cd openwrt
+        echo "============================================"
+        echo " 编译软件包 - $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "============================================"
+
+        # 编译所有软件包 (允许部分包失败)
+        make package/compile -j$(nproc) IGNORE_ERRORS=m 2>&1 | tee /tmp/build_packages.log || \
+          make package/compile -j1 V=s IGNORE_ERRORS=m 2>&1 | tee -a /tmp/build_packages.log || true
+
+        echo "软件包编译完成 - $(date '+%Y-%m-%d %H:%M:%S')"
+
+    - name: 生成软件包索引
+      run: |
+        cd openwrt
+        echo "============================================"
+        echo " 生成索引和安装列表 - $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "============================================"
+
+        # 生成 Packages 索引文件
+        make package/index 2>&1 | tee /tmp/build_index.log || \
+          make package/index V=s 2>&1 | tee -a /tmp/build_index.log || true
+
+        # 编译 target (生成 ImageBuilder/SDK)
+        make target/install -j$(nproc) 2>&1 | tee /tmp/build_target.log || \
+          make target/install -j1 V=s 2>&1 | tee -a /tmp/build_target.log || true
+
+        echo "索引生成完成 - $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # ----- 14. ccache 统计 -----
+    - name: ccache 统计
+      run: ccache -s
+
+    # ----- 15. 提取内核 vermagic -----
+    - name: 提取内核 vermagic
+      id: vermagic
+      run: |
+        cd openwrt
+
+        echo "========== 内核版本信息 =========="
+
+        # 方法1: 从编译好的内核模块提取 vermagic
+        VERMAGIC=""
+        KMOD_FILE=$(find bin/targets/ -name "kernel_*.ipk" -type f | head -1)
+        if [ -n "$KMOD_FILE" ]; then
+          mkdir -p /tmp/kmod_extract
+          cd /tmp/kmod_extract
+          ar x "$GITHUB_WORKSPACE/openwrt/$KMOD_FILE" 2>/dev/null || true
+          if [ -f "control.tar.gz" ]; then
+            tar xzf control.tar.gz 2>/dev/null || true
+          elif [ -f "control.tar.zst" ]; then
+            zstd -d control.tar.zst -o control.tar 2>/dev/null && tar xf control.tar 2>/dev/null || true
+          fi
+          if [ -f "./control" ]; then
+            VERMAGIC=$(grep "^Version:" ./control | head -1 | awk '{print $2}')
+          fi
+          cd "$GITHUB_WORKSPACE/openwrt"
+          rm -rf /tmp/kmod_extract
+        fi
+
+        # 方法2: 从 .config 推导
+        KERNEL_VER=$(grep "^CONFIG_LINUX_" .config | head -1 | sed 's/CONFIG_LINUX_//;s/=y//' | tr '_' '.')
+        KERNEL_VERMAGIC_HASH=$(grep "^CONFIG_LINUX_KERNEL_HASH" .config | cut -d= -f2 | tr -d '"' | head -c 8)
+
+        echo "内核包版本: ${VERMAGIC:-未能提取}"
+        echo "内核版本: ${KERNEL_VER:-未知}"
+        echo ""
+        echo "提示: 如需确认与固件兼容, 请在固件设备上运行:"
+        echo "  opkg info kernel | grep Version"
+        echo "上述输出应与云源的内核版本一致"
+        echo "=================================="
+
+        echo "vermagic=${VERMAGIC}" >> $GITHUB_OUTPUT
+        echo "kernel_ver=${KERNEL_VER}" >> $GITHUB_OUTPUT
+
+    # ----- 16. 统计编译结果 -----
+    - name: 统计编译结果
+      id: build_stats
+      run: |
+        cd openwrt
+        echo "========== 编译结果统计 =========="
+
+        TOTAL_IPK=$(find bin/ -name "*.ipk" 2>/dev/null | wc -l)
+        TOTAL_SIZE=$(du -sh bin/ 2>/dev/null | cut -f1)
+        KMOD_COUNT=$(find bin/targets/ -name "kmod-*.ipk" 2>/dev/null | wc -l)
+
+        echo "软件包总数: $TOTAL_IPK"
+        echo "内核模块数: $KMOD_COUNT"
+        echo "总计大小: $TOTAL_SIZE"
+        echo ""
+        echo "各软件源包数量:"
+        for dir in bin/packages/${{ env.ARCH }}/*/; do
+          if [ -d "$dir" ]; then
+            name=$(basename "$dir")
+            count=$(find "$dir" -name "*.ipk" | wc -l)
+            size=$(du -sh "$dir" | cut -f1)
+            echo "  $name: $count 个 ($size)"
+          fi
+        done
+
+        # 验证 Packages 索引
+        echo ""
+        echo "===== Packages 索引验证 ====="
+        INDEX_OK=0
+        INDEX_FAIL=0
+        for pkg_dir in bin/packages/${{ env.ARCH }}/*/; do
+          if [ -d "$pkg_dir" ]; then
+            name=$(basename "$pkg_dir")
+            if [ -f "$pkg_dir/Packages.gz" ]; then
+              echo "  ✅ $name/Packages.gz"
+              INDEX_OK=$((INDEX_OK + 1))
+            else
+              echo "  ❌ $name/Packages.gz 缺失!"
+              INDEX_FAIL=$((INDEX_FAIL + 1))
+            fi
+          fi
+        done
+        if [ -f "bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/packages/Packages.gz" ]; then
+          echo "  ✅ targets/packages/Packages.gz"
+          INDEX_OK=$((INDEX_OK + 1))
+        else
+          echo "  ❌ targets/packages/Packages.gz 缺失!"
+          INDEX_FAIL=$((INDEX_FAIL + 1))
+        fi
+        echo "索引: $INDEX_OK 正常, $INDEX_FAIL 缺失"
+
+        # 统计失败的包
+        FAILED=0
+        if [ -d "logs" ]; then
+          FAILED=$(find logs/ -name "*.txt" 2>/dev/null | xargs grep -l "^ERROR" 2>/dev/null | wc -l)
+        fi
+        echo ""
+        echo "编译失败: $FAILED 个软件包"
+        echo "=================================="
+
+        echo "total_ipk=$TOTAL_IPK" >> $GITHUB_OUTPUT
+        echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+        echo "kmod_count=$KMOD_COUNT" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+        echo "index_ok=$INDEX_OK" >> $GITHUB_OUTPUT
+        echo "index_fail=$INDEX_FAIL" >> $GITHUB_OUTPUT
+
+        df -hT
+
+    # ----- 17. 整理软件仓库 -----
+    - name: 整理软件仓库
+      run: |
+        chmod +x $GITHUB_WORKSPACE/scripts/organize-repo.sh
+        bash $GITHUB_WORKSPACE/scripts/organize-repo.sh \
+          "$(pwd)/openwrt" \
+          "/home/runner/repo" \
+          "${{ env.OPENWRT_VERSION }}" \
+          "${{ env.TARGET }}" \
+          "${{ env.SUBTARGET }}" \
+          "${{ env.ARCH }}" \
+          "${{ github.repository_owner }}" \
+          "${{ github.event.repository.name }}" \
+          "${{ steps.vermagic.outputs.vermagic }}"
+
+    # ----- 18. 检查仓库大小 -----
+    - name: 检查仓库大小
+      run: |
+        SIZE_MB=$(du -sm /home/runner/repo | cut -f1)
+        echo "软件仓库大小: ${SIZE_MB}MB"
+        if [ "$SIZE_MB" -gt 1000 ]; then
+          echo "::warning::仓库大小 (${SIZE_MB}MB) 较大，GitHub Pages 部署可能受限。可通过 Release 下载完整包。"
+        fi
+
+    # ----- 19. 上传到 GitHub Pages -----
+    - name: 上传 Pages 产物
+      uses: actions/upload-pages-artifact@v3
+      continue-on-error: true
+      with:
+        path: /home/runner/repo
+
+    # ----- 20. 生成发布信息 -----
+    - name: 生成发布信息
+      id: release_info
+      run: |
+        TAG="${{ env.OPENWRT_VERSION }}-$(date +%Y%m%d%H%M%S)"
+        DATE="$(date +%Y-%m-%d)"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "date=$DATE" >> $GITHUB_OUTPUT
+
+    # ----- 21. 打包发布文件 -----
+    - name: 打包发布文件
+      run: |
+        cd openwrt
+        mkdir -p /tmp/release
+
+        # 打包全部用户态软件包 (含 Packages 索引)
+        if [ -d "bin/packages/${{ env.ARCH }}" ]; then
+          tar -czf "/tmp/release/packages-${{ env.ARCH }}.tar.gz" \
+            -C "bin/packages/${{ env.ARCH }}" .
+          echo "已打包: packages-${{ env.ARCH }}.tar.gz"
+        fi
+
+        # 打包目标平台内核模块 (含 Packages 索引)
+        if [ -d "bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/packages" ]; then
+          tar -czf "/tmp/release/kmods-${{ env.TARGET }}-${{ env.SUBTARGET }}.tar.gz" \
+            -C "bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}" packages/
+          echo "已打包: kmods-${{ env.TARGET }}-${{ env.SUBTARGET }}.tar.gz"
+        fi
+
+        # 复制 SDK
+        for f in bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/openwrt-sdk-*.tar.zst; do
+          if [ -f "$f" ]; then
+            cp "$f" /tmp/release/
+            echo "已复制 SDK: $(basename "$f")"
+          fi
+        done
+
+        # 复制 ImageBuilder
+        for f in bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/openwrt-imagebuilder-*.tar.zst; do
+          if [ -f "$f" ]; then
+            cp "$f" /tmp/release/
+            echo "已复制 ImageBuilder: $(basename "$f")"
+          fi
+        done
+
+        # 生成兼容性信息文件
+        cat > /tmp/release/COMPATIBILITY.txt << 'COMPAT_EOF'
+        OpenWrt 云源兼容性信息
+        ======================
+        COMPAT_EOF
+        cat >> /tmp/release/COMPATIBILITY.txt << COMPAT_EOF
+        OpenWrt 版本: ${{ env.OPENWRT_VERSION }}
+        目标平台: ${{ env.TARGET }}/${{ env.SUBTARGET }}
+        架构: ${{ env.ARCH }}
+        内核版本: ${{ steps.vermagic.outputs.kernel_ver }}
+        内核 vermagic: ${{ steps.vermagic.outputs.vermagic }}
+        构建日期: $(date '+%Y-%m-%d %H:%M:%S')
+        软件包总数: ${{ steps.build_stats.outputs.total_ipk }}
+        内核模块数: ${{ steps.build_stats.outputs.kmod_count }}
+        编译失败数: ${{ steps.build_stats.outputs.failed }}
+        私有配置: ${{ env.CONFIG_REPO || '未使用' }}
+        ======================
+        如需验证兼容性, 请在设备上执行:
+          opkg info kernel | grep Version
+        输出的版本号应与上面的 "内核 vermagic" 一致
+        COMPAT_EOF
+        sed -i 's/^        //' /tmp/release/COMPATIBILITY.txt
+
+        echo "发布文件列表:"
+        ls -lh /tmp/release/ 2>/dev/null || echo "无发布文件"
+
+    # ----- 22. 创建 Release -----
+    - name: 创建 Release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: ${{ steps.release_info.outputs.tag }}
+        name: "云源 ${{ env.OPENWRT_VERSION }} (${{ steps.release_info.outputs.date }})"
+        body: |
+          ## 📦 OpenWrt 云源 - ${{ env.OPENWRT_VERSION }}
+
+          | 项目 | 值 |
+          |------|-----|
+          | OpenWrt 版本 | `${{ env.OPENWRT_VERSION }}` |
+          | 目标平台 | `${{ env.TARGET }}/${{ env.SUBTARGET }}` |
+          | 架构 | `${{ env.ARCH }}` |
+          | 内核版本 | `${{ steps.vermagic.outputs.kernel_ver }}` |
+          | 内核 vermagic | `${{ steps.vermagic.outputs.vermagic }}` |
+          | 编译日期 | `${{ steps.release_info.outputs.date }}` |
+          | 软件包总数 | `${{ steps.build_stats.outputs.total_ipk }}` |
+          | 内核模块数 | `${{ steps.build_stats.outputs.kmod_count }}` |
+          | 编译失败数 | `${{ steps.build_stats.outputs.failed }}` |
+          | 索引状态 | `${{ steps.build_stats.outputs.index_ok }}` 正常 / `${{ steps.build_stats.outputs.index_fail }}` 缺失 |
+          | 兼容模式 | ${{ env.CONFIG_REPO != '' && '✅ 100% 兼容 (已同步固件配置)' || '⚠️ 独立模式 (通用配置)' }} |
+
+          ### 📡 云源地址
+
+          ```
+          https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          ```
+
+          ### ⚡ 快速配置
+
+          在路由器上执行:
+          ```bash
+          # 下载并运行配置脚本
+          wget -O /tmp/setup-opkg.sh https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/setup-opkg.sh
+          sh /tmp/setup-opkg.sh
+          ```
+
+          或手动配置:
+          ```bash
+          # 下载 opkg 配置
+          wget -O /etc/opkg/distfeeds.conf https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/opkg-config.conf
+          # 禁用签名检查
+          sed -i 's/option check_signature/# option check_signature/' /etc/opkg.conf
+          # 更新列表
+          opkg update
+          ```
+
+          ### 🔍 验证内核兼容性
+
+          在设备上执行以下命令, 对比内核版本是否与上表一致:
+          ```bash
+          opkg info kernel | grep Version
+          ```
+
+          ### 📥 下载内容
+
+          | 文件 | 说明 |
+          |------|------|
+          | `packages-*.tar.gz` | 全部用户态软件包 (含 Packages 索引) |
+          | `kmods-*.tar.gz` | 全部内核模块 (含 Packages 索引) |
+          | `openwrt-sdk-*.tar.zst` | SDK (可自行编译软件包) |
+          | `openwrt-imagebuilder-*.tar.zst` | ImageBuilder (可自定义固件) |
+          | `COMPATIBILITY.txt` | 兼容性信息 (内核版本/vermagic) |
+        artifacts: "/tmp/release/*"
+        token: ${{ secrets.GITHUB_TOKEN }}
+        makeLatest: true
+        allowUpdates: true
+
+    # ----- 23. 上传编译日志 -----
+    - name: 上传编译日志
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          /tmp/feeds_install.log
+          /tmp/download.log
+          /tmp/build_tools.log
+          /tmp/build_toolchain.log
+          /tmp/build_kernel.log
+          /tmp/build_packages.log
+          /tmp/build_index.log
+          /tmp/build_target.log
+        retention-days: 7
+
+  # ==================== 部署任务 ====================
+  deploy:
+    name: 部署到 GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - name: 部署 Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+      continue-on-error: true
+
+    - name: 部署结果
+      run: |
+        if [ "${{ steps.deployment.outcome }}" = "success" ]; then
+          echo "✅ GitHub Pages 部署成功"
+          echo "🔗 访问地址: ${{ steps.deployment.outputs.page_url }}"
+        else
+          echo "⚠️ GitHub Pages 部署失败或未配置"
+          echo "请在仓库 Settings > Pages 中设置 Source 为 GitHub Actions"
+          echo "软件包仍可通过 Releases 页面下载"
+        fi
