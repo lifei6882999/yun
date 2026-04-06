@@ -328,8 +328,9 @@ jobs:
     # ----- 12. 下载编译依赖 -----
     - name: 下载编译所需源码包
       run: |
+        set -o pipefail
         cd openwrt
-        make download -j16 2>&1 | tee /tmp/download.log
+        make download -j16 2>&1 | tee /tmp/download.log || true
         # 清除损坏的下载 (小于1KB的文件)
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -340,6 +341,7 @@ jobs:
     # ----- 13. 编译全部软件包 -----
     - name: 编译工具链和内核
       run: |
+        set -o pipefail
         cd openwrt
         echo "============================================"
         echo " 编译工具链和内核 - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -349,6 +351,7 @@ jobs:
         echo "============================================"
 
         # 先编译工具链和内核 (这部分必须成功)
+        # 注意: set -o pipefail 确保 make 的退出码不被 tee 吞掉
         make tools/install -j$(nproc) 2>&1 | tee /tmp/build_tools.log || \
           make tools/install -j1 V=s 2>&1 | tee -a /tmp/build_tools.log
         make toolchain/install -j$(nproc) 2>&1 | tee /tmp/build_toolchain.log || \
@@ -360,6 +363,7 @@ jobs:
 
     - name: 编译全部软件包
       run: |
+        set -o pipefail
         cd openwrt
         echo "============================================"
         echo " 编译软件包 - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -373,6 +377,7 @@ jobs:
 
     - name: 生成软件包索引
       run: |
+        set -o pipefail
         cd openwrt
         echo "============================================"
         echo " 生成索引和安装列表 - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -400,13 +405,18 @@ jobs:
 
         echo "========== 内核版本信息 =========="
 
-        # 方法1: 从编译好的内核模块提取 vermagic
         VERMAGIC=""
+        KERNEL_VER=""
+
+        # 方法1: 从编译好的内核包提取 vermagic (通过 ipk 控制文件)
         KMOD_FILE=$(find bin/targets/ -name "kernel_*.ipk" -type f | head -1)
         if [ -n "$KMOD_FILE" ]; then
+          echo "找到内核包: $KMOD_FILE"
           mkdir -p /tmp/kmod_extract
           cd /tmp/kmod_extract
           ar x "$GITHUB_WORKSPACE/openwrt/$KMOD_FILE" 2>/dev/null || true
+          # 列出解压内容用于调试
+          echo "  ipk 内容: $(ls -la 2>/dev/null || echo '解压失败')"
           if [ -f "control.tar.gz" ]; then
             tar xzf control.tar.gz 2>/dev/null || true
           elif [ -f "control.tar.zst" ]; then
@@ -414,16 +424,57 @@ jobs:
           fi
           if [ -f "./control" ]; then
             VERMAGIC=$(grep "^Version:" ./control | head -1 | awk '{print $2}')
+            echo "  方法1 (control): $VERMAGIC"
           fi
           cd "$GITHUB_WORKSPACE/openwrt"
           rm -rf /tmp/kmod_extract
         fi
 
-        # 方法2: 从 .config 推导
-        KERNEL_VER=$(grep "^CONFIG_LINUX_" .config | head -1 | sed 's/CONFIG_LINUX_//;s/=y//' | tr '_' '.')
-        KERNEL_VERMAGIC_HASH=$(grep "^CONFIG_LINUX_KERNEL_HASH" .config | cut -d= -f2 | tr -d '"' | head -c 8)
+        # 方法2: 从内核包文件名提取 (kernel_VERSION_ARCH.ipk)
+        if [ -z "$VERMAGIC" ] && [ -n "$KMOD_FILE" ]; then
+          KMOD_BASENAME=$(basename "$KMOD_FILE")
+          # 文件名格式: kernel_6.6.127~hash-r1_aarch64_cortex-a53.ipk
+          VERMAGIC=$(echo "$KMOD_BASENAME" | sed -n 's/^kernel_\([^_]*\)_.*/\1/p')
+          if [ -n "$VERMAGIC" ]; then
+            echo "  方法2 (文件名): $VERMAGIC"
+          fi
+        fi
 
-        echo "内核包版本: ${VERMAGIC:-未能提取}"
+        # 方法3: 从 .vermagic 文件提取 (OpenWrt 构建时生成)
+        if [ -z "$VERMAGIC" ]; then
+          VERMAGIC_FILE=$(find build_dir/ -name ".vermagic" -type f 2>/dev/null | head -1)
+          if [ -n "$VERMAGIC_FILE" ] && [ -f "$VERMAGIC_FILE" ]; then
+            VERMAGIC_HASH=$(cat "$VERMAGIC_FILE")
+            # .vermagic 仅含 hash, 需要结合内核版本
+            LINUX_VER=""
+            for d in build_dir/target-*/linux-*/; do
+              [ -d "$d" ] && LINUX_VER=$(basename "$d" | sed 's/^linux-//') && break
+            done
+            KVER=$(cat include/kernel-version.mk 2>/dev/null | grep '^LINUX_VERSION-' | head -1 | cut -d= -f2)
+            if [ -n "$KVER" ] && [ -n "$VERMAGIC_HASH" ]; then
+              VERMAGIC="${KVER}-1-${VERMAGIC_HASH}"
+              echo "  方法3 (.vermagic): $VERMAGIC"
+            fi
+          fi
+        fi
+
+        # 提取完整内核版本号
+        # 方法A: 从 vermagic 提取 (如 6.6.127~hash-r1 → 6.6.127)
+        if [ -n "$VERMAGIC" ]; then
+          KERNEL_VER=$(echo "$VERMAGIC" | sed -n 's/^\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')
+        fi
+        # 方法B: 从 include/kernel-version.mk 读取
+        if [ -z "$KERNEL_VER" ] && [ -f "include/kernel-version.mk" ]; then
+          KERNEL_VER=$(grep '^LINUX_VERSION-' include/kernel-version.mk | head -1 | cut -d= -f2)
+          echo "  内核版本 (kernel-version.mk): $KERNEL_VER"
+        fi
+        # 方法C: 从 .config 推导 (仅作最后兜底)
+        if [ -z "$KERNEL_VER" ]; then
+          KERNEL_VER=$(grep "^CONFIG_LINUX_" .config | head -1 | sed 's/CONFIG_LINUX_//;s/=y//' | tr '_' '.')
+        fi
+
+        echo ""
+        echo "内核包版本 (vermagic): ${VERMAGIC:-未能提取}"
         echo "内核版本: ${KERNEL_VER:-未知}"
         echo ""
         echo "提示: 如需确认与固件兼容, 请在固件设备上运行:"
@@ -488,8 +539,39 @@ jobs:
         # 统计失败的包
         FAILED=0
         if [ -d "logs" ]; then
-          FAILED=$(find logs/ -name "*.txt" 2>/dev/null | xargs grep -l "^ERROR" 2>/dev/null | wc -l)
+          # 搜索编译日志中的 ERROR 和 failed 关键字
+          FAILED=$(find logs/ -name "*.txt" 2>/dev/null | xargs -r grep -l -i "error\|failed to build" 2>/dev/null | wc -l)
         fi
+
+        # 同时从编译日志中提取失败信息
+        BUILD_ERRORS=0
+        if [ -f "/tmp/build_packages.log" ]; then
+          BUILD_ERRORS=$(grep -c "ERROR:.*failed to build" /tmp/build_packages.log 2>/dev/null || true)
+          if [ "$BUILD_ERRORS" -gt 0 ]; then
+            echo ""
+            echo "===== 编译失败的软件包 ====="
+            grep "ERROR:.*failed to build" /tmp/build_packages.log | head -50
+            echo "(共 $BUILD_ERRORS 个)"
+          fi
+        fi
+        # 取两种方式的较大值
+        [ "$BUILD_ERRORS" -gt "$FAILED" ] && FAILED=$BUILD_ERRORS
+
+        # 检查空 feed 目录 (有目录但无 .ipk)
+        EMPTY_FEEDS=0
+        for dir in bin/packages/${{ env.ARCH }}/*/; do
+          if [ -d "$dir" ]; then
+            count=$(find "$dir" -name "*.ipk" | wc -l)
+            if [ "$count" -eq 0 ]; then
+              EMPTY_FEEDS=$((EMPTY_FEEDS + 1))
+            fi
+          fi
+        done
+        if [ "$EMPTY_FEEDS" -gt 0 ]; then
+          echo ""
+          echo "⚠️ 警告: $EMPTY_FEEDS 个软件源目录为空 (未生成任何 .ipk)"
+        fi
+
         echo ""
         echo "编译失败: $FAILED 个软件包"
         echo "=================================="
