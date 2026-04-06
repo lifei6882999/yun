@@ -580,9 +580,11 @@ jobs:
         done
 
         # 生成兼容性信息文件
-        cat > /tmp/release/COMPATIBILITY.txt << EOF
+        cat > /tmp/release/COMPATIBILITY.txt << 'COMPAT_EOF'
         OpenWrt 云源兼容性信息
         ======================
+        COMPAT_EOF
+        cat >> /tmp/release/COMPATIBILITY.txt << COMPAT_EOF
         OpenWrt 版本: ${{ env.OPENWRT_VERSION }}
         目标平台: ${{ env.TARGET }}/${{ env.SUBTARGET }}
         架构: ${{ env.ARCH }}
@@ -597,7 +599,8 @@ jobs:
         如需验证兼容性, 请在设备上执行:
           opkg info kernel | grep Version
         输出的版本号应与上面的 "内核 vermagic" 一致
-        EOF
+        COMPAT_EOF
+        sed -i 's/^        //' /tmp/release/COMPATIBILITY.txt
 
         echo "发布文件列表:"
         ls -lh /tmp/release/ 2>/dev/null || echo "无发布文件"

@@ -93,7 +93,7 @@ if wget -q -O /tmp/version-info.json "${REPO_URL}/version-info.json" 2>/dev/null
     rm -f /tmp/version-info.json
 fi
 
-if [ -n "$DEVICE_KERNEL" ] && [ -n "$CLOUD_VERMAGIC" ] && [ "$CLOUD_VERMAGIC" != "null" ] && [ -n "$CLOUD_VERMAGIC" ]; then
+if [ -n "$DEVICE_KERNEL" ] && [ -n "$CLOUD_VERMAGIC" ] && [ "$CLOUD_VERMAGIC" != "null" ]; then
     if [ "$DEVICE_KERNEL" = "$CLOUD_VERMAGIC" ]; then
         echo "  ✅ 内核版本完全匹配: $DEVICE_KERNEL"
         echo "     内核模块 (kmod-*) 可正常安装"
