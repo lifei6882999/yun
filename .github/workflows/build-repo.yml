@@ -1,0 +1,434 @@
+# ============================================================
+# OpenWrt 云源自动构建工作流
+# 功能: 全量编译 OpenWrt 所有软件包并部署为 opkg 在线软件源
+# 平台: MediaTek Filogic (MT7981/MT7986/MT7988)
+# ============================================================
+
+name: 构建 OpenWrt 云源
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt 版本标签 (例: v24.10.6)'
+        required: true
+        default: 'v24.10.6'
+        type: string
+
+  schedule:
+    # 每周六北京时间上午10点 (UTC 02:00) 自动构建
+    - cron: '0 2 * * 6'
+
+  push:
+    branches: [main]
+    paths:
+      - 'config/**'
+      - 'scripts/**'
+      - '.github/workflows/build-repo.yml'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: build-packages
+  cancel-in-progress: true
+
+env:
+  OPENWRT_VERSION: ${{ inputs.openwrt_version || 'v24.10.6' }}
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  TARGET: mediatek
+  SUBTARGET: filogic
+  ARCH: aarch64_cortex-a53
+  TZ: Asia/Shanghai
+
+jobs:
+  # ==================== 编译任务 ====================
+  build:
+    name: 编译全部软件包
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+    # ----- 1. 检出仓库 -----
+    - name: 检出仓库
+      uses: actions/checkout@v4
+
+    # ----- 2. 释放磁盘空间 -----
+    - name: 释放磁盘空间
+      run: |
+        echo "===== 清理前磁盘使用情况 ====="
+        df -hT
+
+        # 删除不需要的大型软件包和工具
+        sudo rm -rf /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/share/boost \
+          /usr/share/swift \
+          /usr/local/share/chromium \
+          /usr/local/share/powershell
+
+        # 删除 Docker 镜像
+        sudo docker rmi $(docker image ls -aq) 2>/dev/null || true
+
+        # 卸载不需要的系统软件
+        sudo apt-get purge -yqq \
+          azure-cli google-cloud-cli microsoft-edge-stable \
+          google-chrome-stable firefox dotnet* aspnetcore* \
+          php* mysql* mongodb* moby* snap* 2>/dev/null || true
+
+        sudo apt-get autoremove -yqq
+        sudo apt-get autoclean
+        sudo rm -rf /var/lib/apt/lists/* /tmp/*
+
+        echo "===== 清理后磁盘使用情况 ====="
+        df -hT
+
+    # ----- 3. 初始化编译环境 -----
+    - name: 初始化编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get update
+        sudo -E apt-get install -yqq \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
+          ecj fastjar flex gawk gettext gcc-multilib g++-multilib git \
+          gnutls-dev gperf haveged help2man intltool lib32gcc-s1 \
+          libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev \
+          libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
+          libpython3-dev libreadline-dev libssl-dev libtool libz-dev lrzsz \
+          mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+          python3 python3-pip python3-ply python3-pyelftools python3-setuptools \
+          qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+          uglifyjs unzip upx-ucl wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get clean
+        sudo -E timedatectl set-timezone "$TZ"
+
+    # ----- 4. 恢复 ccache 缓存 -----
+    - name: 恢复 ccache 缓存
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ env.TARGET }}-${{ env.SUBTARGET }}-${{ env.OPENWRT_VERSION }}
+        restore-keys: |
+          ccache-${{ env.TARGET }}-${{ env.SUBTARGET }}-
+
+    - name: 配置 ccache
+      run: |
+        ccache -M 5G
+        ccache -o compression=true
+        ccache -z
+
+    # ----- 5. 克隆 OpenWrt 源码 -----
+    - name: 克隆 OpenWrt 源码
+      run: |
+        git clone -b ${{ env.OPENWRT_VERSION }} --single-branch --depth=1 \
+          ${{ env.OPENWRT_REPO }} openwrt
+        echo "OpenWrt 源码版本: $(cd openwrt && git log --oneline -1)"
+
+    # ----- 6. 应用自定义脚本 (可选) -----
+    - name: 应用自定义脚本 (diy1.sh)
+      if: hashFiles('scripts/diy1.sh') != ''
+      run: |
+        cd openwrt
+        chmod +x $GITHUB_WORKSPACE/scripts/diy1.sh
+        bash $GITHUB_WORKSPACE/scripts/diy1.sh
+
+    # ----- 7. 添加第三方软件源 -----
+    - name: 添加第三方软件源
+      run: |
+        cd openwrt
+        chmod +x $GITHUB_WORKSPACE/scripts/add-feeds.sh
+        bash $GITHUB_WORKSPACE/scripts/add-feeds.sh
+
+    # ----- 8. 更新并安装软件源 -----
+    - name: 更新软件源
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a 2>&1 | tee /tmp/feeds_update.log || true
+        echo ""
+        echo "===== 已更新的软件源 ====="
+        ls -la feeds/
+
+    - name: 安装软件源
+      run: |
+        cd openwrt
+        ./scripts/feeds install -a -f 2>&1 | tee /tmp/feeds_install.log || true
+
+    # ----- 9. 应用自定义脚本 (可选) -----
+    - name: 应用自定义脚本 (diy2.sh)
+      if: hashFiles('scripts/diy2.sh') != ''
+      run: |
+        cd openwrt
+        chmod +x $GITHUB_WORKSPACE/scripts/diy2.sh
+        bash $GITHUB_WORKSPACE/scripts/diy2.sh
+
+    # ----- 10. 加载编译配置 -----
+    - name: 加载编译配置
+      run: |
+        cd openwrt
+        cp $GITHUB_WORKSPACE/config/seed.config .config
+        make defconfig
+
+        echo "========== 编译配置摘要 =========="
+        echo "目标平台: $(grep '^CONFIG_TARGET_BOARD=' .config | cut -d= -f2 | tr -d '"')"
+        echo "子目标: $(grep '^CONFIG_TARGET_SUBTARGET=' .config | cut -d= -f2 | tr -d '"')"
+        TOTAL_Y=$(grep -c "=y" .config || true)
+        TOTAL_M=$(grep -c "=m" .config || true)
+        echo "编译选项: $TOTAL_Y (=y) + $TOTAL_M (=m)"
+        echo "=================================="
+
+    # ----- 11. 下载编译依赖 -----
+    - name: 下载编译所需源码包
+      run: |
+        cd openwrt
+        make download -j16 2>&1 | tee /tmp/download.log
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        echo "下载目录大小: $(du -sh dl | cut -f1)"
+
+    # ----- 12. 编译全部软件包 -----
+    - name: 编译软件包
+      run: |
+        cd openwrt
+        echo "============================================"
+        echo " 开始编译 - $(date '+%Y-%m-%d %H:%M:%S')"
+        echo " CPU: $(nproc) 核心"
+        echo " 内存: $(free -h | awk '/^Mem:/{print $2}')"
+        echo " 磁盘剩余: $(df -h . | awk 'NR==2{print $4}')"
+        echo "============================================"
+
+        # 先尝试多线程编译，失败则单线程并输出详细日志
+        BUILD_EXIT=0
+        make -j$(nproc) IGNORE_ERRORS=m 2>&1 | tee /tmp/build.log || {
+          echo "多线程编译遇到问题，回退到单线程编译..."
+          make -j1 V=s IGNORE_ERRORS=m 2>&1 | tee -a /tmp/build.log || BUILD_EXIT=$?
+        }
+
+        echo "============================================"
+        echo " 编译完成 - $(date '+%Y-%m-%d %H:%M:%S')"
+        if [ "$BUILD_EXIT" -ne 0 ]; then
+          echo " ⚠️ 部分软件包编译失败 (退出码: $BUILD_EXIT)"
+          echo " 已通过 IGNORE_ERRORS=m 跳过失败的包，继续后续步骤"
+        fi
+        echo "============================================"
+
+    # ----- 13. ccache 统计 -----
+    - name: ccache 统计
+      run: ccache -s
+
+    # ----- 14. 统计编译结果 -----
+    - name: 统计编译结果
+      id: build_stats
+      run: |
+        cd openwrt
+        echo "========== 编译结果统计 =========="
+
+        TOTAL_IPK=$(find bin/ -name "*.ipk" 2>/dev/null | wc -l)
+        TOTAL_SIZE=$(du -sh bin/ 2>/dev/null | cut -f1)
+        KMOD_COUNT=$(find bin/targets/ -name "kmod-*.ipk" 2>/dev/null | wc -l)
+
+        echo "软件包总数: $TOTAL_IPK"
+        echo "内核模块数: $KMOD_COUNT"
+        echo "总计大小: $TOTAL_SIZE"
+        echo ""
+        echo "各软件源包数量:"
+        for dir in bin/packages/${{ env.ARCH }}/*/; do
+          if [ -d "$dir" ]; then
+            name=$(basename "$dir")
+            count=$(find "$dir" -name "*.ipk" | wc -l)
+            size=$(du -sh "$dir" | cut -f1)
+            echo "  $name: $count 个 ($size)"
+          fi
+        done
+
+        # 统计失败的包 (检查 logs 目录)
+        FAILED=0
+        if [ -d "logs" ]; then
+          FAILED=$(find logs/ -name "*.txt" 2>/dev/null | xargs grep -l "^ERROR" 2>/dev/null | wc -l)
+        fi
+        echo ""
+        echo "编译失败: $FAILED 个软件包"
+        echo "=================================="
+
+        echo "total_ipk=$TOTAL_IPK" >> $GITHUB_OUTPUT
+        echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+
+        df -hT
+
+    # ----- 15. 整理软件仓库 -----
+    - name: 整理软件仓库
+      run: |
+        chmod +x $GITHUB_WORKSPACE/scripts/organize-repo.sh
+        bash $GITHUB_WORKSPACE/scripts/organize-repo.sh \
+          "$(pwd)/openwrt" \
+          "/home/runner/repo" \
+          "${{ env.OPENWRT_VERSION }}" \
+          "${{ env.TARGET }}" \
+          "${{ env.SUBTARGET }}" \
+          "${{ env.ARCH }}" \
+          "${{ github.repository_owner }}" \
+          "${{ github.event.repository.name }}"
+
+    # ----- 16. 检查仓库大小 -----
+    - name: 检查仓库大小
+      run: |
+        SIZE_MB=$(du -sm /home/runner/repo | cut -f1)
+        echo "软件仓库大小: ${SIZE_MB}MB"
+        if [ "$SIZE_MB" -gt 1000 ]; then
+          echo "::warning::仓库大小 (${SIZE_MB}MB) 较大，GitHub Pages 部署可能受限。可通过 Release 下载完整包。"
+        fi
+
+    # ----- 17. 上传到 GitHub Pages -----
+    - name: 上传 Pages 产物
+      uses: actions/upload-pages-artifact@v3
+      continue-on-error: true
+      with:
+        path: /home/runner/repo
+
+    # ----- 18. 生成发布信息 -----
+    - name: 生成发布信息
+      id: release_info
+      run: |
+        TAG="${{ env.OPENWRT_VERSION }}-$(date +%Y%m%d%H%M%S)"
+        DATE="$(date +%Y-%m-%d)"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "date=$DATE" >> $GITHUB_OUTPUT
+
+    # ----- 19. 打包发布文件 -----
+    - name: 打包发布文件
+      run: |
+        cd openwrt
+        mkdir -p /tmp/release
+
+        # 打包全部用户态软件包
+        if [ -d "bin/packages/${{ env.ARCH }}" ]; then
+          tar -czf "/tmp/release/packages-${{ env.ARCH }}.tar.gz" \
+            -C "bin/packages/${{ env.ARCH }}" .
+          echo "已打包: packages-${{ env.ARCH }}.tar.gz"
+        fi
+
+        # 打包目标平台内核模块
+        if [ -d "bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/packages" ]; then
+          tar -czf "/tmp/release/kmods-${{ env.TARGET }}-${{ env.SUBTARGET }}.tar.gz" \
+            -C "bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}" packages/
+          echo "已打包: kmods-${{ env.TARGET }}-${{ env.SUBTARGET }}.tar.gz"
+        fi
+
+        # 复制 SDK
+        for f in bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/openwrt-sdk-*.tar.zst; do
+          if [ -f "$f" ]; then
+            cp "$f" /tmp/release/
+            echo "已复制 SDK: $(basename "$f")"
+          fi
+        done
+
+        # 复制 ImageBuilder
+        for f in bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/openwrt-imagebuilder-*.tar.zst; do
+          if [ -f "$f" ]; then
+            cp "$f" /tmp/release/
+            echo "已复制 ImageBuilder: $(basename "$f")"
+          fi
+        done
+
+        echo "发布文件列表:"
+        ls -lh /tmp/release/ 2>/dev/null || echo "无发布文件"
+
+    # ----- 20. 创建 Release -----
+    - name: 创建 Release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: ${{ steps.release_info.outputs.tag }}
+        name: "云源 ${{ env.OPENWRT_VERSION }} (${{ steps.release_info.outputs.date }})"
+        body: |
+          ## 📦 OpenWrt 云源 - ${{ env.OPENWRT_VERSION }}
+
+          | 项目 | 值 |
+          |------|-----|
+          | OpenWrt 版本 | `${{ env.OPENWRT_VERSION }}` |
+          | 目标平台 | `${{ env.TARGET }}/${{ env.SUBTARGET }}` |
+          | 架构 | `${{ env.ARCH }}` |
+          | 编译日期 | `${{ steps.release_info.outputs.date }}` |
+          | 软件包总数 | `${{ steps.build_stats.outputs.total_ipk }}` |
+          | 编译失败数 | `${{ steps.build_stats.outputs.failed }}` |
+
+          ### 📡 云源地址
+
+          ```
+          https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          ```
+
+          ### ⚡ 快速配置
+
+          在路由器上执行:
+          ```bash
+          # 下载并运行配置脚本
+          wget -O /tmp/setup-opkg.sh https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/setup-opkg.sh
+          sh /tmp/setup-opkg.sh
+          ```
+
+          或手动配置:
+          ```bash
+          # 下载 opkg 配置
+          wget -O /etc/opkg/distfeeds.conf https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/opkg-config.conf
+          # 禁用签名检查
+          sed -i 's/option check_signature/# option check_signature/' /etc/opkg.conf
+          # 更新列表
+          opkg update
+          ```
+
+          ### 📥 下载内容
+
+          | 文件 | 说明 |
+          |------|------|
+          | `packages-*.tar.gz` | 全部用户态软件包 |
+          | `kmods-*.tar.gz` | 全部内核模块 |
+          | `openwrt-sdk-*.tar.zst` | SDK (可自行编译软件包) |
+          | `openwrt-imagebuilder-*.tar.zst` | ImageBuilder (可自定义固件) |
+        artifacts: "/tmp/release/*"
+        token: ${{ secrets.GITHUB_TOKEN }}
+        makeLatest: true
+        allowUpdates: true
+
+    # ----- 21. 上传编译日志 -----
+    - name: 上传编译日志
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          /tmp/feeds_update.log
+          /tmp/feeds_install.log
+          /tmp/download.log
+          /tmp/build.log
+        retention-days: 7
+
+  # ==================== 部署任务 ====================
+  deploy:
+    name: 部署到 GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - name: 部署 Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+      continue-on-error: true
+
+    - name: 部署结果
+      run: |
+        if [ "${{ steps.deployment.outcome }}" = "success" ]; then
+          echo "✅ GitHub Pages 部署成功"
+          echo "🔗 访问地址: ${{ steps.deployment.outputs.page_url }}"
+        else
+          echo "⚠️ GitHub Pages 部署失败或未配置"
+          echo "请在仓库 Settings > Pages 中设置 Source 为 GitHub Actions"
+          echo "软件包仍可通过 Releases 页面下载"
+        fi
