@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # 整理编译产物为 opkg 仓库结构
-# 用法: organize-repo.sh <BUILD_DIR> <REPO_DIR> <VERSION> <TARGET> <SUBTARGET> <ARCH> <OWNER> <REPO_NAME>
+# 用法: organize-repo.sh <BUILD_DIR> <REPO_DIR> <VERSION> <TARGET> <SUBTARGET> <ARCH> <OWNER> <REPO_NAME> [VERMAGIC]
 # ============================================================
 
 set -e
@@ -14,6 +14,7 @@ SUBTARGET="${5:?缺少参数: SUBTARGET}"
 ARCH="${6:?缺少参数: ARCH}"
 OWNER="${7:?缺少参数: OWNER}"
 REPO_NAME="${8:?缺少参数: REPO_NAME}"
+VERMAGIC="${9:-}"
 
 PAGES_URL="https://${OWNER}.github.io/${REPO_NAME}"
 
@@ -25,6 +26,7 @@ echo " 目标目录: $REPO_DIR"
 echo " 版本: $VERSION"
 echo " 平台: $TARGET/$SUBTARGET"
 echo " 架构: $ARCH"
+echo " Vermagic: ${VERMAGIC:-未提供}"
 echo "=========================================="
 
 # 清理目标目录
@@ -44,6 +46,22 @@ if [ -d "$BUILD_DIR/bin/targets/$TARGET/$SUBTARGET/packages" ]; then
         "$REPO_DIR/targets/$TARGET/$SUBTARGET/"
     KMOD_COUNT=$(find "$REPO_DIR/targets/$TARGET/$SUBTARGET/packages" -name "*.ipk" | wc -l)
     echo "  内核模块: $KMOD_COUNT 个"
+
+    # 验证 Packages 索引
+    if [ ! -f "$REPO_DIR/targets/$TARGET/$SUBTARGET/packages/Packages.gz" ]; then
+        echo "  ⚠️ Packages.gz 缺失, 尝试重新生成..."
+        if [ -x "$BUILD_DIR/scripts/ipkg-make-index.sh" ]; then
+            cd "$REPO_DIR/targets/$TARGET/$SUBTARGET/packages"
+            "$BUILD_DIR/scripts/ipkg-make-index.sh" . > Packages
+            gzip -k Packages
+            cd "$OLDPWD"
+            echo "  ✅ 已重新生成 Packages 索引"
+        else
+            echo "  ❌ 无法重新生成 (缺少 ipkg-make-index.sh)"
+        fi
+    else
+        echo "  ✅ Packages.gz 索引正常"
+    fi
 fi
 
 # 2. 复制各软件源包
@@ -55,7 +73,19 @@ if [ -d "$BUILD_DIR/bin/packages/$ARCH" ]; then
             feed_name=$(basename "$feed_dir")
             cp -r "$feed_dir" "$REPO_DIR/packages/$ARCH/"
             PKG_COUNT=$(find "$REPO_DIR/packages/$ARCH/$feed_name" -name "*.ipk" | wc -l)
-            echo "  $feed_name: $PKG_COUNT 个"
+
+            # 验证每个 feed 的 Packages 索引
+            if [ ! -f "$REPO_DIR/packages/$ARCH/$feed_name/Packages.gz" ]; then
+                echo "  ⚠️ $feed_name: $PKG_COUNT 个 (Packages.gz 缺失, 重新生成...)"
+                if [ -x "$BUILD_DIR/scripts/ipkg-make-index.sh" ]; then
+                    cd "$REPO_DIR/packages/$ARCH/$feed_name"
+                    "$BUILD_DIR/scripts/ipkg-make-index.sh" . > Packages
+                    gzip -k Packages
+                    cd "$OLDPWD"
+                fi
+            else
+                echo "  ✅ $feed_name: $PKG_COUNT 个"
+            fi
         fi
     done
 fi
@@ -75,10 +105,25 @@ done
 TOTAL_IPK=$(find "$REPO_DIR" -name "*.ipk" | wc -l)
 TOTAL_SIZE=$(du -sh "$REPO_DIR" | cut -f1)
 
+# ===== 生成兼容性信息文件 =====
+cat > "$REPO_DIR/version-info.json" << EOF
+{
+  "openwrt_version": "$VERSION",
+  "target": "$TARGET",
+  "subtarget": "$SUBTARGET",
+  "arch": "$ARCH",
+  "vermagic": "$VERMAGIC",
+  "total_packages": $TOTAL_IPK,
+  "build_date": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "repo_url": "$PAGES_URL"
+}
+EOF
+
 # ===== 生成 opkg 配置文件 =====
 cat > "$REPO_DIR/opkg-config.conf" << EOF
 # OpenWrt 自定义云源配置
 # 版本: $VERSION | 平台: $TARGET/$SUBTARGET | 架构: $ARCH
+# 内核: ${VERMAGIC:-未知}
 # 生成日期: $(date '+%Y-%m-%d %H:%M:%S')
 #
 # 使用方法:
@@ -111,6 +156,16 @@ for feed_dir in "$REPO_DIR/packages/$ARCH"/*/; do
     fi
 done
 
+# ===== 生成 sha256sums =====
+echo "生成 SHA256 校验文件..."
+cd "$REPO_DIR"
+find . -name "*.ipk" -type f | sort | while read -r f; do
+    sha256sum "$f"
+done > sha256sums.txt
+SHA256_COUNT=$(wc -l < sha256sums.txt)
+echo "  已生成 $SHA256_COUNT 条校验记录"
+cd "$OLDPWD"
+
 # ===== 生成首页 index.html =====
 # 收集各 feed 信息
 FEED_ROWS=""
@@ -118,14 +173,26 @@ for feed_dir in "$REPO_DIR/packages/$ARCH"/*/; do
     if [ -d "$feed_dir" ]; then
         feed_name=$(basename "$feed_dir")
         pkg_count=$(find "$feed_dir" -name "*.ipk" | wc -l)
-        FEED_ROWS="${FEED_ROWS}<tr><td><a href=\"packages/${ARCH}/${feed_name}/\">${feed_name}</a></td><td>${pkg_count}</td></tr>"
+        has_index="✅"
+        [ ! -f "$feed_dir/Packages.gz" ] && has_index="❌"
+        FEED_ROWS="${FEED_ROWS}<tr><td><a href=\"packages/${ARCH}/${feed_name}/\">${feed_name}</a></td><td>${pkg_count}</td><td>${has_index}</td></tr>"
     fi
 done
 
 KMOD_ROW=""
 if [ -d "$REPO_DIR/targets/$TARGET/$SUBTARGET/packages" ]; then
     kmod_count=$(find "$REPO_DIR/targets/$TARGET/$SUBTARGET/packages" -name "*.ipk" | wc -l)
-    KMOD_ROW="<tr><td><a href=\"targets/${TARGET}/${SUBTARGET}/packages/\">kernel modules</a></td><td>${kmod_count}</td></tr>"
+    has_index="✅"
+    [ ! -f "$REPO_DIR/targets/$TARGET/$SUBTARGET/packages/Packages.gz" ] && has_index="❌"
+    KMOD_ROW="<tr><td><a href=\"targets/${TARGET}/${SUBTARGET}/packages/\">kernel modules (kmod-*)</a></td><td>${kmod_count}</td><td>${has_index}</td></tr>"
+fi
+
+# 判断兼容模式
+COMPAT_MODE="独立模式 (通用配置)"
+COMPAT_COLOR="#e67e22"
+if [ -n "$VERMAGIC" ]; then
+    COMPAT_MODE="100% 兼容模式"
+    COMPAT_COLOR="#27ae60"
 fi
 
 cat > "$REPO_DIR/index.html" << HTMLEOF
@@ -147,11 +214,13 @@ cat > "$REPO_DIR/index.html" << HTMLEOF
         a { color: #3498db; text-decoration: none; }
         a:hover { text-decoration: underline; }
         .info { background: #e8f4f8; border-left: 4px solid #3498db; padding: 15px; margin: 15px 0; border-radius: 0 4px 4px 0; }
+        .warning { background: #fef9e7; border-left: 4px solid #f39c12; padding: 15px; margin: 15px 0; border-radius: 0 4px 4px 0; }
         .code { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Courier New', monospace; font-size: 14px; white-space: pre; }
         .stats { display: flex; gap: 20px; flex-wrap: wrap; margin: 15px 0; }
         .stat-card { background: #3498db; color: white; padding: 15px 20px; border-radius: 8px; flex: 1; min-width: 150px; text-align: center; }
         .stat-card .number { font-size: 28px; font-weight: bold; }
         .stat-card .label { font-size: 14px; opacity: 0.9; }
+        .compat-badge { display: inline-block; padding: 5px 12px; border-radius: 4px; color: white; font-weight: bold; background: ${COMPAT_COLOR}; }
         footer { text-align: center; margin-top: 20px; color: #999; font-size: 14px; }
     </style>
 </head>
@@ -177,12 +246,20 @@ cat > "$REPO_DIR/index.html" << HTMLEOF
         <div class="info">
             <strong>📋 平台信息:</strong> ${TARGET}/${SUBTARGET} (${ARCH})<br>
             <strong>📅 构建日期:</strong> $(date '+%Y-%m-%d %H:%M:%S')<br>
-            <strong>📊 总大小:</strong> ${TOTAL_SIZE}
+            <strong>📊 总大小:</strong> ${TOTAL_SIZE}<br>
+            <strong>🔧 内核版本:</strong> ${VERMAGIC:-未提供}<br>
+            <strong>🏷️ 兼容模式:</strong> <span class="compat-badge">${COMPAT_MODE}</span>
+        </div>
+
+        <div class="warning">
+            <strong>⚠️ 内核模块兼容性提示:</strong><br>
+            安装 kmod-* 内核模块前，请在设备上执行 <code>opkg info kernel | grep Version</code> 确认内核版本与云源一致。<br>
+            如版本不一致，内核模块将无法安装。用户态软件包 (非 kmod) 不受此限制。
         </div>
 
         <h2>📂 软件源列表</h2>
         <table>
-            <tr><th>软件源</th><th>包数量</th></tr>
+            <tr><th>软件源</th><th>包数量</th><th>索引</th></tr>
             ${KMOD_ROW}
             ${FEED_ROWS}
         </table>
@@ -209,6 +286,8 @@ opkg update</div>
             <tr><td><a href="packages/">packages/</a></td><td>用户态软件包 (按架构分类)</td></tr>
             <tr><td><a href="supplementary/">supplementary/</a></td><td>SDK / ImageBuilder</td></tr>
             <tr><td><a href="opkg-config.conf">opkg-config.conf</a></td><td>opkg 配置文件</td></tr>
+            <tr><td><a href="version-info.json">version-info.json</a></td><td>版本和兼容性信息 (JSON)</td></tr>
+            <tr><td><a href="sha256sums.txt">sha256sums.txt</a></td><td>SHA256 校验文件</td></tr>
         </table>
     </div>
     <footer>
