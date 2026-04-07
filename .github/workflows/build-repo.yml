@@ -185,8 +185,25 @@ jobs:
     # ----- 5. 克隆 OpenWrt 源码 -----
     - name: 克隆 OpenWrt 源码
       run: |
+        # DL 缓存可能已创建 openwrt/dl 目录，需先保存再恢复
+        DL_TMP=""
+        if [ -d openwrt/dl ]; then
+          DL_TMP=$(mktemp -d)
+          echo "检测到 DL 缓存目录, 先保存到 $DL_TMP ..."
+          mv openwrt/dl "$DL_TMP/dl"
+          rm -rf openwrt
+        fi
+
         git clone -b ${{ env.OPENWRT_VERSION }} --single-branch --depth=1 \
           ${{ env.OPENWRT_REPO }} openwrt
+
+        # 恢复 DL 缓存
+        if [ -n "$DL_TMP" ] && [ -d "$DL_TMP/dl" ]; then
+          echo "恢复 DL 缓存..."
+          mv "$DL_TMP/dl" openwrt/dl
+          rm -rf "$DL_TMP"
+        fi
+
         echo "OpenWrt 源码版本: $(cd openwrt && git log --oneline -1)"
 
     # ----- 6. [100% 兼容] 克隆私有配置仓库 -----
